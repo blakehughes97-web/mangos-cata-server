@@ -69,6 +69,7 @@
 
 #ifdef WIN32
 #include "ServiceWin32.h"
+#include "WheatyExceptionReport.h"
 char serviceName[] = "realmd";
 char serviceLongName[] = "MaNGOS realmd service";
 char serviceDescription[] = "Massive Network Game Object Server";
@@ -87,6 +88,24 @@ bool StartDB();
 void UnhookSignals();
 void HookSignals();
 
+#ifdef _WIN32
+#include <windows.h>
+#include <string>
+/// Update the console title with current auth/waiting and connection counts, only if changed.
+static void UpdateConsoleTitle(uint32 authWaiting, uint32 connections)
+{
+    static std::string s_lastTitle;
+    char title[128];
+    snprintf(title, sizeof(title), "MaNGOS Realm-Daemon (%u Auth/Waiting - %u Connections)", authWaiting, connections);
+    std::string newTitle(title);
+    if (s_lastTitle != newTitle)
+    {
+        s_lastTitle = newTitle;
+        SetConsoleTitleA(title);
+    }
+}
+#endif
+
 bool stopEvent = false;                                     ///< Setting it to true stops the server
 
 DatabaseType LoginDatabase;                                 ///< Accessor to the realm server database
@@ -101,19 +120,19 @@ DatabaseType LoginDatabase;                                 ///< Accessor to the
 void usage(const char* prog)
 {
     sLog.outString("Usage: \n %s [<options>]\n"
-                   "    -v, --version            print version and exist\n\r"
-                   "    -c config_file           use config_file as configuration file\n\r"
+                "    -v, --version            print version and exist\n\r"
+                "    -c config_file           use config_file as configuration file\n\r"
 #ifdef WIN32
-                   "    Running as service functions:\n\r"
-                   "    -s run                   run as service\n\r"
-                   "    -s install               install service\n\r"
-                   "    -s uninstall             uninstall service\n\r"
+                "    Running as service functions:\n\r"
+                "    -s run                   run as service\n\r"
+                "    -s install               install service\n\r"
+                "    -s uninstall             uninstall service\n\r"
 #else
-                   "    Running as daemon functions:\n\r"
-                   "    -s run                   run as daemon\n\r"
-                   "    -s stop                  stop daemon\n\r"
+                "    Running as daemon functions:\n\r"
+                "    -s run                   run as daemon\n\r"
+                "    -s stop                  stop daemon\n\r"
 #endif
-                   , prog);
+                , prog);
 }
 
 /**
@@ -136,6 +155,11 @@ void usage(const char* prog)
  */
 extern int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    static WheatyExceptionReport exceptionReport;
+    SetUnhandledExceptionFilter(WheatyExceptionReport::WheatyUnhandledExceptionFilter);
+#endif
+
     ///- Command line parsing
     char const* cfg_file = REALMD_CONFIG_LOCATION;
 
@@ -430,6 +454,14 @@ extern int main(int argc, char** argv)
             DETAIL_LOG("Ping MySQL to keep connection alive");
             LoginDatabase.Ping();
         }
+#ifdef _WIN32
+        static uint32 titleUpdateCounter = 0;
+        if ((++titleUpdateCounter) >= 30) // ~3 seconds at 100ms reactor interval
+        {
+            titleUpdateCounter = 0;
+            UpdateConsoleTitle(AuthSocket::GetAuthWaitingCount(), AuthSocket::GetConnectionCount());
+        }
+#endif
 #ifdef WIN32
         if (m_ServiceStatus == 0)
         {
@@ -437,7 +469,7 @@ extern int main(int argc, char** argv)
         }
         while (m_ServiceStatus == 2)
         {
-             Sleep(1000);
+            Sleep(1000);
         }
 #endif
     }
@@ -453,6 +485,7 @@ extern int main(int argc, char** argv)
 }
 
 /// Handle termination signals
+
 /** Put the global variable stopEvent to 'true' if a termination signal is caught **/
 void OnSignal(int s)
 {
