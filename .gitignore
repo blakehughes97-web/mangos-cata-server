@@ -129,3 +129,6 @@ msbuild.cmd
 
 # File generated during compile
 /dep/libmpq/compile
+/cata-database
+/mariadb-10.6.3-winx64
+CMakeLists - Copy.txt
