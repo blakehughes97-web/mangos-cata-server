@@ -305,7 +305,7 @@ UpdateMask Player::updateVisualBits;
  *
  * @param session The owning world session.
  */
-Player::Player(WorldSession* session): Unit(), m_mover(this), m_camera(this), m_petMgr(this), m_achievementMgr(this), m_reputationMgr(this), m_glyphMgr(this), m_honorMgr(this), m_currencyMgr(this)
+Player::Player(WorldSession* session): Unit(), m_mover(this), m_camera(this), m_petMgr(this), m_achievementMgr(this), m_reputationMgr(this), m_glyphMgr(this), m_honorMgr(this), m_currencyMgr(this), m_runeMgr(this), m_spellCooldownMgr(this)
 {
     m_transport = 0;
 
@@ -530,7 +530,6 @@ Player::Player(WorldSession* session): Unit(), m_mover(this), m_camera(this), m_
 
     // Initialize declined name to NULL
     m_declinedname = NULL;
-    m_runes = NULL;
 
     // Initialize last fall time to 0
     m_lastFallTime = 0;
@@ -597,7 +596,6 @@ Player::~Player()
         }
 
     delete m_declinedname;
-    delete m_runes;
 }
 
 /**
@@ -2335,85 +2333,6 @@ void Player::SetGMVisible(bool on)
 }
 
 /**
- * @brief Checks whether another player should be visible through group visibility rules.
- *
- * @param p The player to test visibility against.
- * @return True if the player is group-visible; otherwise, false.
- */
-bool Player::IsGroupVisibleFor(Player* p) const
-{
-    switch (sWorld.getConfig(CONFIG_UINT32_GROUP_VISIBILITY))
-    {
-        default:
-            return IsInSameGroupWith(p);
-        case 1:
-            return IsInSameRaidWith(p);
-        case 2:
-            return GetTeam() == p->GetTeam();
-    }
-}
-
-/**
- * @brief Checks whether this player and another player are in the same subgroup.
- *
- * @param p The other player to compare.
- * @return True if both players share the same group context; otherwise, false.
- */
-bool Player::IsInSameGroupWith(Player const* p) const
-{
-    return (p == this || (GetGroup() != NULL &&
-                          GetGroup()->SameSubGroup(this, p)));
-}
-
-///- If the player is invited, remove him. If the group if then only 1 person, disband the group.
-/// \todo Shouldn't we also check if there is no other invitees before disbanding the group?
-void Player::UninviteFromGroup()
-{
-    Group* group = GetGroupInvite();
-    if (!group)
-    {
-        return;
-    }
-
-    group->RemoveInvite(this);
-
-    if (group->GetMembersCount() <= 1)                      // group has just 1 member => disband
-    {
-        if (group->IsCreated())
-        {
-            group->Disband(true);
-            sObjectMgr.RemoveGroup(group);
-        }
-        else
-        {
-            group->RemoveAllInvites();
-        }
-
-        delete group;
-    }
-}
-
-/**
- * @brief Removes a member from a group and disposes of the group if it becomes empty.
- *
- * @param group The group to remove the member from.
- * @param guid The GUID of the member to remove.
- */
-void Player::RemoveFromGroup(Group* group, ObjectGuid guid)
-{
-    if (group)
-    {
-        if (group->RemoveMember(guid, 0) <= 1)
-        {
-            // group->Disband(); already disbanded in RemoveMember
-            sObjectMgr.RemoveGroup(group);
-            delete group;
-            // RemoveMember sets the player's group pointer to NULL
-        }
-    }
-}
-
-/**
  * @brief Sends the experience gain log packet to the client.
  *
  * @param GivenXP The base amount of experience awarded.
@@ -2886,7 +2805,7 @@ void Player::SendInitialSpells()
      * * * * * * * * * * * * * * * * */
     uint16 spellCount = 0;
 
-    WorldPacket data(SMSG_INITIAL_SPELLS, (1 + 2 + 4 * m_spells.size() + 2 + m_spellCooldowns.size() * (2 + 2 + 2 + 4 + 4)));
+    WorldPacket data(SMSG_INITIAL_SPELLS, (1 + 2 + 4 * m_spells.size() + 2 + GetSpellCooldownMap().size() * (2 + 2 + 2 + 4 + 4)));
     data << uint8(0);
 
     /* * * * * * * * * * * * * * * * *
@@ -2922,9 +2841,9 @@ void Player::SendInitialSpells()
     data.put<uint16>(countPos, spellCount);                 // write real count value
 
     /* For each spell the player has on cooldown */
-    uint16 spellCooldowns = m_spellCooldowns.size();
+    uint16 spellCooldowns = GetSpellCooldownMap().size();
     data << uint16(spellCooldowns);
-    for (SpellCooldowns::const_iterator itr = m_spellCooldowns.begin(); itr != m_spellCooldowns.end(); ++itr)
+    for (SpellCooldowns::const_iterator itr = GetSpellCooldownMap().begin(); itr != GetSpellCooldownMap().end(); ++itr)
     {
         /* If the spell doesn't exist in the spellbook, just ignore it */
         SpellEntry const* sEntry = sSpellStore.LookupEntry(itr->first);
@@ -3780,131 +3699,6 @@ void Player::SendMovieStart(uint32 MovieId)
 #endif
 
 /**
- * @brief Updates outdoor-only effects and exploration discovery for the current position.
- */
-void Player::CheckAreaExploreAndOutdoor()
-{
-    if (!IsAlive())
-    {
-        return;
-    }
-
-    if (IsTaxiFlying())
-    {
-        return;
-    }
-
-    bool isOutdoor;
-    uint16 areaFlag = GetTerrain()->GetAreaFlag(GetPositionX(), GetPositionY(), GetPositionZ(), &isOutdoor);
-
-    if (isOutdoor)
-    {
-        if (HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING) && GetRestType() == REST_TYPE_IN_TAVERN)
-        {
-            AreaTriggerEntry const* at = sAreaTriggerStore.LookupEntry(inn_trigger_id);
-            if (!at || !IsPointInAreaTriggerZone(at, GetMapId(), GetPositionX(), GetPositionY(), GetPositionZ()))
-            {
-                // Player left inn (REST_TYPE_IN_CITY overrides REST_TYPE_IN_TAVERN, so just clear rest)
-                SetRestType(REST_TYPE_NO);
-            }
-        }
-        // Check if we need to reaply outdoor only passive spells
-        const PlayerSpellMap& sp_list = GetSpellMap();
-        for (PlayerSpellMap::const_iterator itr = sp_list.begin(); itr != sp_list.end(); ++itr)
-        {
-            if (itr->second.state == PLAYERSPELL_REMOVED)
-            {
-                continue;
-            }
-            SpellEntry const* spellInfo = sSpellStore.LookupEntry(itr->first);
-            if (!spellInfo || !IsNeedCastSpellAtOutdoor(spellInfo) || HasAura(itr->first))
-            {
-                continue;
-            }
-
-            SpellShapeshiftEntry const* shapeShift = spellInfo->GetSpellShapeshift();
-
-            if (!shapeShift || (shapeShift->Stances || shapeShift->StancesNot) && !IsNeedCastSpellAtFormApply(spellInfo, GetShapeshiftForm()))
-            {
-                continue;
-            }
-            CastSpell(this, itr->first, true, NULL);
-        }
-    }
-    else if (sWorld.getConfig(CONFIG_BOOL_VMAP_INDOOR_CHECK) && !isGameMaster())
-    {
-        RemoveAurasWithAttribute(SPELL_ATTR_OUTDOORS_ONLY);
-    }
-
-    if (areaFlag == 0xffff)
-    {
-        return;
-    }
-    int offset = areaFlag / 32;
-
-    if (offset >= PLAYER_EXPLORED_ZONES_SIZE)
-    {
-        sLog.outError("Wrong area flag %u in map data for (X: %f Y: %f) point to field PLAYER_EXPLORED_ZONES_1 + %u ( %u must be < %u ).", areaFlag, GetPositionX(), GetPositionY(), offset, offset, PLAYER_EXPLORED_ZONES_SIZE);
-        return;
-    }
-
-    uint32 val = (uint32)(1 << (areaFlag % 32));
-    uint32 currFields = GetUInt32Value(PLAYER_EXPLORED_ZONES_1 + offset);
-
-    if (!(currFields & val))
-    {
-        SetUInt32Value(PLAYER_EXPLORED_ZONES_1 + offset, (uint32)(currFields | val));
-
-        GetAchievementMgr().UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_EXPLORE_AREA);
-
-        AreaTableEntry const* p = GetAreaEntryByAreaFlagAndMap(areaFlag, GetMapId());
-        if (!p)
-        {
-            sLog.outError("PLAYER: Player %u discovered unknown area (x: %f y: %f map: %u", GetGUIDLow(), GetPositionX(), GetPositionY(), GetMapId());
-        }
-        else if (p->area_level > 0)
-        {
-            uint32 area = p->ID;
-            if (getLevel() >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
-            {
-                SendExplorationExperience(area, 0);
-            }
-            else
-            {
-                int32 diff = int32(getLevel()) - p->area_level;
-                uint32 XP = 0;
-                if (diff < -5)
-                {
-                    XP = uint32(sObjectMgr.GetBaseXP(getLevel() + 5) * sWorld.getConfig(CONFIG_FLOAT_RATE_XP_EXPLORE));
-                }
-                else if (diff > 5)
-                {
-                    int32 exploration_percent = (100 - ((diff - 5) * 5));
-                    if (exploration_percent > 100)
-                    {
-                        exploration_percent = 100;
-                    }
-                    else if (exploration_percent < 0)
-                    {
-                        exploration_percent = 0;
-                    }
-
-                    XP = uint32(sObjectMgr.GetBaseXP(p->area_level) * exploration_percent / 100 * sWorld.getConfig(CONFIG_FLOAT_RATE_XP_EXPLORE));
-                }
-                else
-                {
-                    XP = uint32(sObjectMgr.GetBaseXP(p->area_level) * sWorld.getConfig(CONFIG_FLOAT_RATE_XP_EXPLORE));
-                }
-
-                GiveXP(XP, NULL);
-                SendExplorationExperience(area, XP);
-            }
-            DETAIL_LOG("PLAYER: Player %u discovered a new area: %u", GetGUIDLow(), area);
-        }
-    }
-}
-
-/**
  * @brief Gets the faction team associated with a race.
  *
  * @param race The race identifier to evaluate.
@@ -4009,39 +3803,6 @@ void Player::SendGuildDeclined(std::string name, bool autodecline)
 }
 
 /**
- * @brief Updates area-specific player state and auras.
- *
- * @param newArea The new area identifier.
- */
-void Player::UpdateArea(uint32 newArea)
-{
-    m_areaUpdateId    = newArea;
-
-    AreaTableEntry const* area = GetAreaEntryByAreaID(newArea);
-
-    // FFA_PVP flags are area and not zone id dependent
-    // so apply them accordingly
-    if (area && (area->flags & AREA_FLAG_ARENA))
-    {
-        if (!isGameMaster())
-        {
-            SetFFAPvP(true);
-        }
-    }
-    else
-    {
-        // remove ffa flag only if not ffapvp realm
-        // removal in sanctuaries and capitals is handled in zone update
-        if (IsFFAPvP() && !sWorld.IsFFAPvPRealm())
-        {
-            SetFFAPvP(false);
-        }
-    }
-
-    UpdateAreaDependentAuras();
-}
-
-/**
  * @brief Checks whether the player is eligible to interact with a capture point.
  *
  * @return True if the player can use the capture point; otherwise, false.
@@ -4055,131 +3816,6 @@ bool Player::CanUseCapturePoint()
            !HasMovementFlag(MOVEFLAG_FLYING) &&
            !IsTaxiFlying() &&
            !isGameMaster();
-}
-
-/**
- * @brief Updates zone and area state after the player changes location.
- *
- * @param newZone The new zone identifier.
- * @param newArea The new area identifier.
- */
-void Player::UpdateZone(uint32 newZone, uint32 newArea)
-{
-    /* If we're trying to update into a zone that doesn't exist, just return */
-    AreaTableEntry const* zone = GetAreaEntryByAreaID(newZone);
-    if (!zone)
-    {
-        return;
-    }
-
-    /* If we're moving into a different zone */
-    if (m_zoneUpdateId != newZone)
-    {
-        // handle outdoor pvp zones
-        sOutdoorPvPMgr.HandlePlayerLeaveZone(this, m_zoneUpdateId);
-        sOutdoorPvPMgr.HandlePlayerEnterZone(this, newZone);
-
-        SendInitWorldStates(newZone, newArea);              // only if really enters to new zone, not just area change, works strange...
-
-        if (sWorld.getConfig(CONFIG_BOOL_WEATHER))
-        {
-            Weather* wth = GetMap()->GetWeatherSystem()->FindOrCreateWeather(newZone);
-            wth->SendWeatherUpdateToPlayer(this);
-        }
-    }
-
-    // Used by Eluna
-#ifdef ENABLE_ELUNA
-    if (Eluna* e = GetEluna())
-    {
-        e->OnUpdateZone(this, newZone, newArea);
-    }
-#endif /* ENABLE_ELUNA */
-
-    m_zoneUpdateId    = newZone;
-    m_zoneUpdateTimer = ZONE_UPDATE_INTERVAL;
-
-    // zone changed, so area changed as well, update it
-    UpdateArea(newArea);
-
-    // in PvP, any not controlled zone (except zone->team == 6, default case)
-    // in PvE, only opposition team capital
-    switch (zone->team)
-    {
-        case AREATEAM_ALLY:
-            pvpInfo.inHostileArea = GetTeam() != ALLIANCE && (sWorld.IsPvPRealm() || zone->flags & AREA_FLAG_CAPITAL);
-            break;
-        case AREATEAM_HORDE:
-            pvpInfo.inHostileArea = GetTeam() != HORDE && (sWorld.IsPvPRealm() || zone->flags & AREA_FLAG_CAPITAL);
-            break;
-        case AREATEAM_NONE:
-            // overwrite for battlegrounds, maybe batter some zone flags but current known not 100% fit to this
-            pvpInfo.inHostileArea = sWorld.IsPvPRealm() || InBattleGround();
-            break;
-        default:                                            // 6 in fact
-            pvpInfo.inHostileArea = false;
-            break;
-    }
-
-    if (pvpInfo.inHostileArea)                              // in hostile area
-    {
-        if (!IsPvP() || pvpInfo.endTimer != 0)
-        {
-            UpdatePvP(true, true);
-        }
-    }
-    else                                                    // in friendly area
-    {
-        if (IsPvP() && !HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_IN_PVP) && pvpInfo.endTimer == 0)
-        {
-            pvpInfo.endTimer = time(0); // start toggle-off
-        }
-    }
-
-    if (zone->flags & AREA_FLAG_SANCTUARY)                  // in sanctuary
-    {
-        SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_SANCTUARY);
-        if (sWorld.IsFFAPvPRealm())
-        {
-            SetFFAPvP(false);
-        }
-    }
-    else
-    {
-        RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_SANCTUARY);
-    }
-
-    if (zone->flags & AREA_FLAG_CAPITAL)                    // in capital city
-    {
-        SetRestType(REST_TYPE_IN_CITY);
-    }
-    else if (HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING) && GetRestType() != REST_TYPE_IN_TAVERN)
-    {
-        // resting and not in tavern (leave city then); tavern leave handled in CheckAreaExploreAndOutdoor
-        SetRestType(REST_TYPE_NO);
-    }
-
-    // remove items with area/map limitations (delete only for alive player to allow back in ghost mode)
-    // if player resurrected at teleport this will be applied in resurrect code
-    if (IsAlive())
-    {
-        DestroyZoneLimitedItem(true, newZone);
-    }
-
-    // check some item equip limitations (in result lost CanTitanGrip at talent reset, for example)
-    AutoUnequipOffhandIfNeed();
-
-    // recent client version not send leave/join channel packets for built-in local channels
-    UpdateLocalChannels(newZone);
-
-    // group update
-    if (GetGroup())
-    {
-        SetGroupUpdateFlag(GROUP_UPDATE_FLAG_ZONE);
-    }
-
-    UpdateZoneDependentAuras();
-    UpdateZoneDependentPets();
 }
 
 /**
@@ -4290,27 +3926,6 @@ void Player::SendInitWorldStates(uint32 zoneid, uint32 areaid)
     data.put<uint16>(count_pos, count);                     // set actual world state amount
 
     GetSession()->SendPacket(&data);
-}
-
-/**
- * @brief Consumes and returns the rested experience bonus for an XP award.
- *
- * @param xp The base experience amount being awarded.
- * @return The rested bonus experience amount.
- */
-uint32 Player::GetXPRestBonus(uint32 xp)
-{
-    uint32 rested_bonus = (uint32)GetRestBonus();           // xp for each rested bonus
-
-    if (rested_bonus > xp)                                  // max rested_bonus == xp or (r+x) = 200% xp
-    {
-        rested_bonus = xp;
-    }
-
-    SetRestBonus(GetRestBonus() - rested_bonus);
-
-    DETAIL_LOG("Player gain %u xp (+ %u Rested Bonus). Rested points=%f", xp + rested_bonus, rested_bonus, GetRestBonus());
-    return rested_bonus;
 }
 
 /**
@@ -4577,84 +4192,6 @@ void Player::SendExplorationExperience(uint32 Area, uint32 Experience)
     GetSession()->SendPacket(&data);
 }
 
-/*********************************************************/
-/***              Update timers                        ***/
-/*********************************************************/
-
-/// checks the 15 afk reports per 5 minutes limit
-void Player::UpdateAfkReport(time_t currTime)
-{
-    if (m_bgData.bgAfkReportedTimer <= currTime)
-    {
-        m_bgData.bgAfkReportedCount = 0;
-        m_bgData.bgAfkReportedTimer = currTime + 5 * MINUTE;
-    }
-}
-
-void Player::UpdateContestedPvP(uint32 diff)
-{
-    if (!m_contestedPvPTimer || IsInCombat())
-    {
-        return;
-    }
-    if (m_contestedPvPTimer <= diff)
-    {
-        ResetContestedPvP();
-    }
-    else
-    {
-        m_contestedPvPTimer -= diff;
-    }
-}
-
-/**
- * @brief Updates and clears the player's PvP flag when the timeout expires.
- *
- * @param currTime The current server time.
- */
-void Player::UpdatePvPFlag(time_t currTime)
-{
-    if (!IsPvP())
-    {
-        return;
-    }
-    if (pvpInfo.endTimer == 0 || currTime < (pvpInfo.endTimer + 300))
-    {
-        return;
-    }
-
-    UpdatePvP(false);
-}
-
-/**
- * @brief Starts an active duel once the duel countdown completes.
- *
- * @param currTime The current server time.
- */
-void Player::UpdateDuelFlag(time_t currTime)
-{
-    if (!duel || duel->startTimer == 0 || currTime < duel->startTimer + 3)
-    {
-        return;
-    }
-
-    // Used by Eluna
-#ifdef ENABLE_ELUNA
-    if (Eluna* e = GetEluna())
-    {
-        e->OnDuelStart(this, duel->opponent);
-    }
-#endif /* ENABLE_ELUNA */
-
-    SetUInt32Value(PLAYER_DUEL_TEAM, 1);
-    duel->opponent->SetUInt32Value(PLAYER_DUEL_TEAM, 2);
-
-    duel->startTimer = 0;
-    duel->startTime  = currTime;
-    duel->opponent->duel->startTimer = 0;
-    duel->opponent->duel->startTime  = currTime;
-}
-
 // send Proficiency
 void Player::SendProficiency(ItemClass itemClass, uint32 itemSubclassMask)
 {
@@ -4701,49 +4238,6 @@ void Player::RemovePetitionsAndSigns(ObjectGuid guid)
     CharacterDatabase.PExecute("DELETE FROM `petition` WHERE `ownerguid` = '%u'", lowguid);
     CharacterDatabase.PExecute("DELETE FROM `petition_sign` WHERE `ownerguid` = '%u'", lowguid);
     CharacterDatabase.CommitTransaction();
-}
-
-/**
- * @brief Sets the player's accumulated rested experience bonus.
- *
- * @param rest_bonus_new The new rested bonus amount.
- */
-void Player::SetRestBonus(float rest_bonus_new)
-{
-    // Prevent resting on max level
-    if (getLevel() >= sWorld.getConfig(CONFIG_UINT32_MAX_PLAYER_LEVEL))
-    {
-        rest_bonus_new = 0;
-    }
-
-    if (rest_bonus_new < 0)
-    {
-        rest_bonus_new = 0;
-    }
-
-    float rest_bonus_max = (float)GetUInt32Value(PLAYER_NEXT_LEVEL_XP) * 1.5f / 2.0f;
-
-    if (rest_bonus_new > rest_bonus_max)
-    {
-        m_rest_bonus = rest_bonus_max;
-    }
-    else
-    {
-        m_rest_bonus = rest_bonus_new;
-    }
-
-    // update data for client
-    if (m_rest_bonus > 10)
-    {
-        SetByteValue(PLAYER_BYTES_2, 3, REST_STATE_RESTED);
-    }
-    else if (m_rest_bonus <= 1)
-    {
-        SetByteValue(PLAYER_BYTES_2, 3, REST_STATE_NORMAL);
-    }
-
-    // RestTickUpdate
-    SetUInt32Value(PLAYER_REST_STATE_EXPERIENCE, uint32(m_rest_bonus));
 }
 
 /**
@@ -4931,302 +4425,11 @@ void Player::InitDisplayIds()
 
 
 /**
- * @brief Updates the invalid-instance homebind timer and teleports when it expires.
- *
- * @param time The elapsed update time in milliseconds.
- */
-void Player::UpdateHomebindTime(uint32 time)
-{
-    // GMs never get homebind timer online
-    if (m_InstanceValid || isGameMaster())
-    {
-        if (m_HomebindTimer)                                // instance valid, but timer not reset
-        {
-            // hide reminder
-            WorldPacket data(SMSG_RAID_GROUP_ONLY, 4 + 4);
-            data << uint32(0);
-            data << uint32(ERR_RAID_GROUP_NONE);            // error used only when timer = 0
-            GetSession()->SendPacket(&data);
-        }
-        // instance is valid, reset homebind timer
-        m_HomebindTimer = 0;
-    }
-    else if (m_HomebindTimer > 0)
-    {
-        if (time >= m_HomebindTimer)
-        {
-            // teleport to nearest graveyard
-            RepopAtGraveyard();
-        }
-        else
-        {
-            m_HomebindTimer -= time;
-        }
-    }
-    else
-    {
-        // instance is invalid, start homebind timer
-        m_HomebindTimer = 60000;
-        // send message to player
-        WorldPacket data(SMSG_RAID_GROUP_ONLY, 4 + 4);
-        data << uint32(m_HomebindTimer);
-        data << uint32(ERR_RAID_GROUP_NONE);                // error used only when timer = 0
-        GetSession()->SendPacket(&data);
-        DEBUG_LOG("PLAYER: Player '%s' (GUID: %u) will be teleported to homebind in 60 seconds", GetName(), GetGUIDLow());
-    }
-}
-
-/**
- * @brief Sets or clears the player's PvP state with timeout-aware handling.
- *
- * @param state True to enable PvP; false to disable it.
- * @param ovrride True to bypass the delayed PvP timeout behavior.
- */
-void Player::UpdatePvP(bool state, bool ovrride)
-{
-    if (!state || ovrride)
-    {
-        SetPvP(state);
-        pvpInfo.endTimer = 0;
-    }
-    else
-    {
-        if (pvpInfo.endTimer != 0)
-        {
-            pvpInfo.endTimer = time(NULL);
-        }
-        else
-        {
-            SetPvP(state);
-        }
-    }
-}
-
-// slot to be excluded while counting
-bool Player::EnchantmentFitsRequirements(uint32 enchantmentcondition, int8 slot)
-{
-    if (!enchantmentcondition)
-    {
-        return true;
-    }
-
-    SpellItemEnchantmentConditionEntry const* Condition = sSpellItemEnchantmentConditionStore.LookupEntry(enchantmentcondition);
-
-    if (!Condition)
-    {
-        return true;
-    }
-
-    uint8 curcount[4] = {0, 0, 0, 0};
-
-    // counting current equipped gem colors
-    for (uint8 i = EQUIPMENT_SLOT_START; i < EQUIPMENT_SLOT_END; ++i)
-    {
-        if (i == slot)
-        {
-            continue;
-        }
-        Item* pItem2 = GetItemByPos(INVENTORY_SLOT_BAG_0, i);
-        if (pItem2 && !pItem2->IsBroken() && pItem2->GetProto()->Socket[0].Color)
-        {
-            for (uint32 enchant_slot = SOCK_ENCHANTMENT_SLOT; enchant_slot < SOCK_ENCHANTMENT_SLOT + 3; ++enchant_slot)
-            {
-                uint32 enchant_id = pItem2->GetEnchantmentId(EnchantmentSlot(enchant_slot));
-                if (!enchant_id)
-                {
-                    continue;
-                }
-
-                SpellItemEnchantmentEntry const* enchantEntry = sSpellItemEnchantmentStore.LookupEntry(enchant_id);
-                if (!enchantEntry)
-                {
-                    continue;
-                }
-
-                uint32 gemid = enchantEntry->GemID;
-                if (!gemid)
-                {
-                    continue;
-                }
-
-                ItemPrototype const* gemProto = sItemStorage.LookupEntry<ItemPrototype>(gemid);
-                if (!gemProto)
-                {
-                    continue;
-                }
-
-                GemPropertiesEntry const* gemProperty = sGemPropertiesStore.LookupEntry(gemProto->GemProperties);
-                if (!gemProperty)
-                {
-                    continue;
-                }
-
-                uint8 GemColor = gemProperty->color;
-
-                for (uint8 b = 0, tmpcolormask = 1; b < 4; ++b, tmpcolormask <<= 1)
-                {
-                    if (tmpcolormask & GemColor)
-                    {
-                        ++curcount[b];
-                    }
-                }
-            }
-        }
-    }
-
-    bool activate = true;
-
-    for (int i = 0; i < 5; ++i)
-    {
-        if (!Condition->Color[i])
-        {
-            continue;
-        }
-
-        uint32 _cur_gem = curcount[Condition->Color[i] - 1];
-
-        // if have <CompareColor> use them as count, else use <value> from Condition
-        uint32 _cmp_gem = Condition->CompareColor[i] ? curcount[Condition->CompareColor[i] - 1] : Condition->Value[i];
-
-        switch (Condition->Comparator[i])
-        {
-            case 2:                                         // requires less <color> than (<value> || <comparecolor>) gems
-                activate &= (_cur_gem < _cmp_gem) ? true : false;
-                break;
-            case 3:                                         // requires more <color> than (<value> || <comparecolor>) gems
-                activate &= (_cur_gem > _cmp_gem) ? true : false;
-                break;
-            case 5:                                         // requires at least <color> than (<value> || <comparecolor>) gems
-                activate &= (_cur_gem >= _cmp_gem) ? true : false;
-                break;
-        }
-    }
-
-    DEBUG_LOG("Checking Condition %u, there are %u Meta Gems, %u Red Gems, %u Yellow Gems and %u Blue Gems, Activate:%s", enchantmentcondition, curcount[0], curcount[1], curcount[2], curcount[3], activate ? "yes" : "no");
-
-    return activate;
-}
-
-void Player::CorrectMetaGemEnchants(uint8 exceptslot, bool apply)
-{
-    // cycle all equipped items
-    for (uint32 slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-    {
-        // enchants for the slot being socketed are handled by Player::ApplyItemMods
-        if (slot == exceptslot)
-        {
-            continue;
-        }
-
-        Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-
-        if (!pItem || !pItem->GetProto()->Socket[0].Color)
-        {
-            continue;
-        }
-
-        for (uint32 enchant_slot = SOCK_ENCHANTMENT_SLOT; enchant_slot < SOCK_ENCHANTMENT_SLOT + 3; ++enchant_slot)
-        {
-            uint32 enchant_id = pItem->GetEnchantmentId(EnchantmentSlot(enchant_slot));
-            if (!enchant_id)
-            {
-                continue;
-            }
-
-            SpellItemEnchantmentEntry const* enchantEntry = sSpellItemEnchantmentStore.LookupEntry(enchant_id);
-            if (!enchantEntry)
-            {
-                continue;
-            }
-
-            uint32 condition = enchantEntry->EnchantmentCondition;
-            if (condition)
-            {
-                // was enchant active with/without item?
-                bool wasactive = EnchantmentFitsRequirements(condition, apply ? exceptslot : -1);
-                // should it now be?
-                if (wasactive != EnchantmentFitsRequirements(condition, apply ? -1 : exceptslot))
-                {
-                    // ignore item gem conditions
-                    // if state changed, (dis)apply enchant
-                    ApplyEnchantment(pItem, EnchantmentSlot(enchant_slot), !wasactive, true, true);
-                }
-            }
-        }
-    }
-}
-
-// if false -> then toggled off if was on| if true -> toggled on if was off AND meets requirements
-void Player::ToggleMetaGemsActive(uint8 exceptslot, bool apply)
-{
-    // cycle all equipped items
-    for (int slot = EQUIPMENT_SLOT_START; slot < EQUIPMENT_SLOT_END; ++slot)
-    {
-        // enchants for the slot being socketed are handled by WorldSession::HandleSocketOpcode(WorldPacket& recv_data)
-        if (slot == exceptslot)
-        {
-            continue;
-        }
-
-        Item* pItem = GetItemByPos(INVENTORY_SLOT_BAG_0, slot);
-
-        if (!pItem || !pItem->GetProto()->Socket[0].Color)  // if item has no sockets or no item is equipped go to next item
-        {
-            continue;
-        }
-
-        // cycle all (gem)enchants
-        for (uint32 enchant_slot = SOCK_ENCHANTMENT_SLOT; enchant_slot < SOCK_ENCHANTMENT_SLOT + 3; ++enchant_slot)
-        {
-            uint32 enchant_id = pItem->GetEnchantmentId(EnchantmentSlot(enchant_slot));
-            if (!enchant_id)                                // if no enchant go to next enchant(slot)
-            {
-                continue;
-            }
-
-            SpellItemEnchantmentEntry const* enchantEntry = sSpellItemEnchantmentStore.LookupEntry(enchant_id);
-            if (!enchantEntry)
-            {
-                continue;
-            }
-
-            // only metagems to be (de)activated, so only enchants with condition
-            uint32 condition = enchantEntry->EnchantmentCondition;
-            if (condition)
-            {
-                ApplyEnchantment(pItem, EnchantmentSlot(enchant_slot), apply);
-            }
-        }
-    }
-}
-
-/**
  * @brief Initializes the number of primary professions the player may learn.
  */
 void Player::InitPrimaryProfessions()
 {
     SetFreePrimaryProfessions(sWorld.getConfig(CONFIG_UINT32_MAX_PRIMARY_TRADE_SKILL));
-}
-
-/**
- * @brief Assigns the player to a group and subgroup.
- *
- * @param group The group to join, or NULL to clear membership.
- * @param subgroup The subgroup index when joining a group.
- */
-void Player::SetGroup(Group* group, int8 subgroup)
-{
-    if (group == NULL)
-    {
-        m_group.unlink();
-    }
-    else
-    {
-        // never use SetGroup without a subgroup unless you specify NULL for group
-        MANGOS_ASSERT(subgroup >= 0);
-        m_group.link(group, this);
-        m_group.setSubGroup((uint8)subgroup);
-    }
 }
 
 void Player::SendInitialPacketsBeforeAddToMap()
@@ -5351,96 +4554,6 @@ void Player::SendInitialPacketsAfterAddToMap()
     UpdateSpeed(MOVE_RUN, true, 1.0f, true);
     UpdateSpeed(MOVE_SWIM, true, 1.0f, true);
     UpdateSpeed(MOVE_FLIGHT, true, 1.0f, true);
-}
-
-/**
- * @brief Flushes pending group update data to out-of-range group members.
- */
-void Player::SendUpdateToOutOfRangeGroupMembers()
-{
-    if (m_groupUpdateMask == GROUP_UPDATE_FLAG_NONE)
-    {
-        return;
-    }
-    if (Group* group = GetGroup())
-    {
-        group->UpdatePlayerOutOfRange(this);
-    }
-
-    m_groupUpdateMask = GROUP_UPDATE_FLAG_NONE;
-    m_auraUpdateMask = 0;
-    if (Pet* pet = GetPet())
-    {
-        pet->ResetAuraUpdateMask();
-    }
-}
-
-/**
- * @brief Sends the appropriate transfer-aborted feedback for an area lock failure.
- *
- * @param mapEntry The destination map entry.
- * @param lockStatus The evaluated area lock status.
- * @param miscRequirement Extra requirement data used by some messages.
- */
-void Player::SendTransferAbortedByLockStatus(MapEntry const* mapEntry, AreaLockStatus lockStatus, uint32 miscRequirement)
-{
-    MANGOS_ASSERT(mapEntry);
-
-    DEBUG_LOG("SendTransferAbortedByLockStatus: Called for %s on map %u, LockAreaStatus %u, miscRequirement %u)", GetGuidStr().c_str(), mapEntry->MapID, lockStatus, miscRequirement);
-
-    switch (lockStatus)
-    {
-        case AREA_LOCKSTATUS_TOO_LOW_LEVEL:
-            GetSession()->SendAreaTriggerMessage(GetSession()->GetMangosString(LANG_LEVEL_MINREQUIRED), miscRequirement);
-            break;
-        case AREA_LOCKSTATUS_ZONE_IN_COMBAT:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_ZONE_IN_COMBAT);
-            break;
-        case AREA_LOCKSTATUS_INSTANCE_IS_FULL:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_MAX_PLAYERS);
-            break;
-        case AREA_LOCKSTATUS_QUEST_NOT_COMPLETED:
-            if (mapEntry->MapID == 269)                     // Exception for Black Morass
-            {
-                GetSession()->SendAreaTriggerMessage("%s", GetSession()->GetMangosString(LANG_TELEREQ_QUEST_BLACK_MORASS));
-                break;
-            }
-            else if (mapEntry->IsContinent())               // do not report anything for quest areatrigge
-            {
-                DEBUG_LOG("SendTransferAbortedByLockStatus: LockAreaStatus %u, do not teleport, no message sent (mapId %u)", lockStatus, mapEntry->MapID);
-                break;
-            }
-            // No break here!
-            [[fallthrough]];
-        case AREA_LOCKSTATUS_MISSING_ITEM:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_DIFFICULTY, GetDifficulty(mapEntry->IsRaid()));
-            break;
-        case AREA_LOCKSTATUS_MISSING_DIFFICULTY:
-        {
-            Difficulty difficulty = GetDifficulty(mapEntry->IsRaid());
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_DIFFICULTY, difficulty > RAID_DIFFICULTY_10MAN_HEROIC ? RAID_DIFFICULTY_10MAN_HEROIC : difficulty);
-            break;
-        }
-        case AREA_LOCKSTATUS_INSUFFICIENT_EXPANSION:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_INSUF_EXPAN_LVL, miscRequirement);
-            break;
-        case AREA_LOCKSTATUS_NOT_ALLOWED:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_MAP_NOT_ALLOWED);
-            break;
-        case AREA_LOCKSTATUS_RAID_LOCKED:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_NEED_GROUP);
-            break;
-        case AREA_LOCKSTATUS_UNKNOWN_ERROR:
-            GetSession()->SendTransferAborted(mapEntry->MapID, TRANSFER_ABORT_ERROR);
-            break;
-        case AREA_LOCKSTATUS_OK:
-            sLog.outError("SendTransferAbortedByLockStatus: LockAreaStatus AREA_LOCKSTATUS_OK received for %s (mapId %u)", GetGuidStr().c_str(), mapEntry->MapID);
-            MANGOS_ASSERT(false);
-            break;
-        default:
-            sLog.outError("SendTransfertAbortedByLockstatus: unhandled LockAreaStatus %u, when %s attempts to enter in map %u", lockStatus, GetGuidStr().c_str(), mapEntry->MapID);
-            break;
-    }
 }
 
 /**
@@ -5967,71 +5080,6 @@ void Player::Uncharm()
     }
 }
 
-/**
- * @brief Applies or removes auras that depend on the player's current zone.
- */
-void Player::UpdateZoneDependentAuras()
-{
-    // Some spells applied at enter into zone (with subzones), aura removed in UpdateAreaDependentAuras that called always at zone->area update
-    SpellAreaForAreaMapBounds saBounds = sSpellMgr.GetSpellAreaForAreaMapBounds(m_zoneUpdateId);
-    for (SpellAreaForAreaMap::const_iterator itr = saBounds.first; itr != saBounds.second; ++itr)
-    {
-        itr->second->ApplyOrRemoveSpellIfCan(this, m_zoneUpdateId, 0, true);
-    }
-}
-
-/**
- * @brief Applies or removes auras that depend on the player's current subzone.
- */
-void Player::UpdateAreaDependentAuras()
-{
-    // remove auras from spells with area limitations
-    for (SpellAuraHolderMap::iterator iter = m_spellAuraHolders.begin(); iter != m_spellAuraHolders.end();)
-    {
-        // use m_zoneUpdateId for speed: UpdateArea called from UpdateZone or instead UpdateZone in both cases m_zoneUpdateId up-to-date
-        if (sSpellMgr.GetSpellAllowedInLocationError(iter->second->GetSpellProto(), GetMapId(), m_zoneUpdateId, m_areaUpdateId, this) != SPELL_CAST_OK)
-        {
-            RemoveSpellAuraHolder(iter->second);
-            iter = m_spellAuraHolders.begin();
-        }
-        else
-        {
-            ++iter;
-        }
-    }
-
-    // some auras applied at subzone enter
-    SpellAreaForAreaMapBounds saBounds = sSpellMgr.GetSpellAreaForAreaMapBounds(m_areaUpdateId);
-    for (SpellAreaForAreaMap::const_iterator itr = saBounds.first; itr != saBounds.second; ++itr)
-    {
-        itr->second->ApplyOrRemoveSpellIfCan(this, m_zoneUpdateId, m_areaUpdateId, true);
-    }
-}
-
-struct UpdateZoneDependentPetsHelper
-{
-    explicit UpdateZoneDependentPetsHelper(Player* _owner, uint32 zone, uint32 area) : owner(_owner), zone_id(zone), area_id(area) {}
-    void operator()(Unit* unit) const
-    {
-        if (unit->GetTypeId() == TYPEID_UNIT && ((Creature*)unit)->IsPet() && !((Pet*)unit)->isControlled())
-            if (uint32 spell_id = unit->GetUInt32Value(UNIT_CREATED_BY_SPELL))
-                if (SpellEntry const* spellEntry = sSpellStore.LookupEntry(spell_id))
-                    if (sSpellMgr.GetSpellAllowedInLocationError(spellEntry, owner->GetMapId(), zone_id, area_id, owner) != SPELL_CAST_OK)
-                    {
-                        ((Pet*)unit)->Unsummon(PET_SAVE_AS_DELETED, owner);
-                    }
-    }
-    Player* owner;
-    uint32 zone_id;
-    uint32 area_id;
-};
-
-void Player::UpdateZoneDependentPets()
-{
-    // check pet (permanent pets ignored), minipet, guardians (including protector)
-    CallForAllControlledUnits(UpdateZoneDependentPetsHelper(this, m_zoneUpdateId, m_areaUpdateId), CONTROLLED_PET | CONTROLLED_GUARDIANS | CONTROLLED_MINIPET);
-}
-
 uint32 Player::GetNextResetTalentsCost()    const
 {
     // The first time reset costs 1 gold
@@ -6070,107 +5118,6 @@ uint32 Player::GetNextResetTalentsCost()    const
             }
             return new_cost;
         }
-    }
-}
-
-/**
- * @brief Selects a random nearby raid member within a radius.
- *
- * @param radius The maximum search radius.
- * @return A random eligible raid member, or NULL if none are found.
- */
-Player* Player::GetNextRandomRaidMember(float radius)
-{
-    Group* pGroup = GetGroup();
-    if (!pGroup)
-    {
-        return NULL;
-    }
-
-    std::vector<Player*> nearMembers;
-    nearMembers.reserve(pGroup->GetMembersCount());
-
-    for (GroupReference* itr = pGroup->GetFirstMember(); itr != NULL; itr = itr->next())
-    {
-        Player* Target = itr->getSource();
-
-        // IsHostileTo check duel and controlled by enemy
-        if (Target && Target != this && IsWithinDistInMap(Target, radius) &&
-                !Target->HasInvisibilityAura() && !IsHostileTo(Target))
-                {
-                    nearMembers.push_back(Target);
-                }
-    }
-
-    if (nearMembers.empty())
-    {
-        return NULL;
-    }
-
-    uint32 randTarget = urand(0, nearMembers.size() - 1);
-    return nearMembers[randTarget];
-}
-
-/**
- * @brief Checks whether the player is allowed to uninvite someone from the group.
- *
- * @return The party result code describing whether uninvite is allowed.
- */
-PartyResult Player::CanUninviteFromGroup() const
-{
-    const Group* grp = GetGroup();
-    if (!grp)
-    {
-        return ERR_NOT_IN_GROUP;
-    }
-
-    if (!grp->IsLeader(GetObjectGuid()) && !grp->IsAssistant(GetObjectGuid()))
-    {
-        return ERR_NOT_LEADER;
-    }
-
-    if (InBattleGround())
-    {
-        return ERR_INVITE_RESTRICTED;
-    }
-
-    return ERR_PARTY_RESULT_OK;
-}
-
-void Player::UpdateGroupLeaderFlag(const bool remove /*= false*/)
-{
-    const Group* group = GetGroup();
-    if (HasFlag(PLAYER_FLAGS, PLAYER_FLAGS_GROUP_LEADER))
-    {
-        if (remove || !group || group->GetLeaderGuid() != GetObjectGuid())
-        {
-            RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_GROUP_LEADER);
-        }
-    }
-    else if (!remove && group && group->GetLeaderGuid() == GetObjectGuid())
-    {
-        SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_GROUP_LEADER);
-    }
-}
-
-/**
- * @brief Stores the player's original non-battleground group reference.
- *
- * @param group The original group, or NULL to clear it.
- * @param subgroup The original subgroup index.
- */
-void Player::SetOriginalGroup(Group* group, int8 subgroup)
-{
-    if (group == NULL)
-    {
-        m_originalGroup.unlink();
-    }
-    else
-    {
-        // never use SetOriginalGroup without a subgroup unless you specify NULL for group
-        MANGOS_ASSERT(subgroup >= 0);
-        m_originalGroup.link(group, this);
-        m_originalGroup.setSubGroup((uint8)subgroup);
     }
 }
 
@@ -7233,186 +6180,12 @@ Object* Player::GetObjectByTypeMask(ObjectGuid guid, TypeMask typemask)
     return NULL;
 }
 
-/**
- * @brief Updates the player's current resting state.
- *
- * @param n_r_type The new rest type.
- * @param areaTriggerId The inn or rest area trigger identifier, if applicable.
- */
-void Player::SetRestType(RestType n_r_type, uint32 areaTriggerId /*= 0*/)
-{
-    rest_type = n_r_type;
-
-    if (rest_type == REST_TYPE_NO)
-    {
-        RemoveFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING);
-
-        // Set player to FFA PVP when not in rested environment.
-        if (sWorld.IsFFAPvPRealm())
-        {
-            SetFFAPvP(true);
-        }
-    }
-    else
-    {
-        SetFlag(PLAYER_FLAGS, PLAYER_FLAGS_RESTING);
-
-        inn_trigger_id = areaTriggerId;
-        time_inn_enter = time(NULL);
-
-        if (sWorld.IsFFAPvPRealm())
-        {
-            SetFFAPvP(false);
-        }
-    }
-}
-
 // Player::SendCurrencies / Get/SendCurrencyWeekCap / GetCurrencyTotalCap / Get*Count moved
 // to CurrencyMgr (2026-05-12); thin delegating wrappers live inline in Player.h.
 
 // Player::ModifyCurrencyCount / SetCurrencyCount / _LoadCurrencies / _SaveCurrencies /
 // SetCurrencyFlags / ResetCurrencyWeekCounts moved to CurrencyMgr (2026-05-12);
 // thin delegating wrappers live inline in Player.h.
-
-/**
- * @brief Evaluates whether the player can use an area trigger into another map.
- *
- * @param at The area trigger being used.
- * @param miscRequirement Output requirement data for failure messaging.
- * @return The evaluated area lock status.
- */
-AreaLockStatus Player::GetAreaTriggerLockStatus(AreaTrigger const* at, Difficulty difficulty, uint32& miscRequirement)
-{
-    miscRequirement = 0;
-
-    if (!at)
-    {
-        return AREA_LOCKSTATUS_UNKNOWN_ERROR;
-    }
-
-    MapEntry const* mapEntry = sMapStore.LookupEntry(at->target_mapId);
-    if (!mapEntry)
-    {
-        return AREA_LOCKSTATUS_UNKNOWN_ERROR;
-    }
-
-    bool isRegularTargetMap = !mapEntry->IsDungeon() || GetDifficulty(mapEntry->IsRaid()) == REGULAR_DIFFICULTY;
-
-    MapDifficultyEntry const* mapDiff = GetMapDifficultyData(at->target_mapId, difficulty);
-    if (mapEntry->IsDungeon() && !mapDiff)
-    {
-        return AREA_LOCKSTATUS_MISSING_DIFFICULTY;
-    }
-
-    // Expansion requirement
-    if (GetSession()->Expansion() < mapEntry->Expansion())
-    {
-        miscRequirement = mapEntry->Expansion();
-        return AREA_LOCKSTATUS_INSUFFICIENT_EXPANSION;
-    }
-
-    // Gamemaster can always enter
-    if (isGameMaster())
-    {
-        return AREA_LOCKSTATUS_OK;
-    }
-
-    // Level Requirements
-    if (getLevel() < at->requiredLevel && !sWorld.getConfig(CONFIG_BOOL_INSTANCE_IGNORE_LEVEL))
-    {
-        miscRequirement = at->requiredLevel;
-        return AREA_LOCKSTATUS_TOO_LOW_LEVEL;
-    }
-    if (!isRegularTargetMap && !sWorld.getConfig(CONFIG_BOOL_INSTANCE_IGNORE_LEVEL) && getLevel() < uint32(maxLevelForExpansion[mapEntry->Expansion()]))
-    {
-        miscRequirement = maxLevelForExpansion[mapEntry->Expansion()];
-        return AREA_LOCKSTATUS_TOO_LOW_LEVEL;
-    }
-
-    // Raid Requirements
-    if (mapEntry->IsRaid() && !sWorld.getConfig(CONFIG_BOOL_INSTANCE_IGNORE_RAID))
-        if (!GetGroup() || !GetGroup()->isRaidGroup())
-        {
-            return AREA_LOCKSTATUS_RAID_LOCKED;
-        }
-
-    // Item Requirements: must have requiredItem OR requiredItem2, report the first one that's missing
-    if (at->requiredItem)
-    {
-        if (!HasItemCount(at->requiredItem, 1) &&
-                (!at->requiredItem2 || !HasItemCount(at->requiredItem2, 1)))
-        {
-            miscRequirement = at->requiredItem;
-            return AREA_LOCKSTATUS_MISSING_ITEM;
-        }
-    }
-    else if (at->requiredItem2 && !HasItemCount(at->requiredItem2, 1))
-    {
-        miscRequirement = at->requiredItem2;
-        return AREA_LOCKSTATUS_MISSING_ITEM;
-    }
-    // Heroic item requirements
-    if (!isRegularTargetMap && at->heroicKey)
-    {
-        if (!HasItemCount(at->heroicKey, 1) && (!at->heroicKey2 || !HasItemCount(at->heroicKey2, 1)))
-        {
-            miscRequirement = at->heroicKey;
-            return AREA_LOCKSTATUS_MISSING_ITEM;
-        }
-    }
-    else if (!isRegularTargetMap && at->heroicKey2 && !HasItemCount(at->heroicKey2, 1))
-    {
-        miscRequirement = at->heroicKey2;
-        return AREA_LOCKSTATUS_MISSING_ITEM;
-    }
-
-    // Quest Requirements
-    if (isRegularTargetMap && at->requiredQuest && !GetQuestRewardStatus(at->requiredQuest))
-    {
-        miscRequirement = at->requiredQuest;
-        return AREA_LOCKSTATUS_QUEST_NOT_COMPLETED;
-    }
-    if (!isRegularTargetMap && at->requiredQuestHeroic && !GetQuestRewardStatus(at->requiredQuestHeroic))
-    {
-        miscRequirement = at->requiredQuestHeroic;
-        return AREA_LOCKSTATUS_QUEST_NOT_COMPLETED;
-    }
-
-    // If the map is not created, assume it is possible to enter it.
-    DungeonPersistentState* state = GetBoundInstanceSaveForSelfOrGroup(at->target_mapId);
-    Map* map = sMapMgr.FindMap(at->target_mapId, state ? state->GetInstanceId() : 0);
-
-    // ToDo add achievement check
-
-    // Map's state check
-    if (map && map->IsDungeon())
-    {
-        // cannot enter if the instance is full (player cap), GMs don't count
-        if (((DungeonMap*)map)->GetPlayersCountExceptGMs() >= ((DungeonMap*)map)->GetMaxPlayers())
-        {
-            return AREA_LOCKSTATUS_INSTANCE_IS_FULL;
-        }
-
-        // In Combat check
-        if (map && map->GetInstanceData() && map->GetInstanceData()->IsEncounterInProgress())
-        {
-            return AREA_LOCKSTATUS_ZONE_IN_COMBAT;
-        }
-
-        // Bind Checks
-        InstancePlayerBind* pBind = GetBoundInstance(at->target_mapId, GetDifficulty(mapEntry->IsRaid()));
-        if (pBind && pBind->perm && pBind->state != state)
-        {
-            return AREA_LOCKSTATUS_HAS_BIND;
-        }
-        if (pBind && pBind->perm && pBind->state != map->GetPersistentState())
-        {
-            return AREA_LOCKSTATUS_HAS_BIND;
-        }
-    }
-
-    return AREA_LOCKSTATUS_OK;
-}
 
 const uint32 armorSpecToClass[MAX_CLASSES] =
 {
@@ -7590,41 +6363,6 @@ bool Player::FitArmorSpecializationRules(SpellEntry const * spellProto) const
     }
 
     return true;
-}
-
-/**
- * @brief Computes rested experience gained over a period of time.
- *
- * @param timePassed The elapsed time in seconds.
- * @param offline True when the gain is being computed for offline time.
- * @param inRestPlace True when the player is in a rest area while offline.
- * @return The amount of rested experience bonus gained.
- */
-float Player::ComputeRest(time_t timePassed, bool offline /*= false*/, bool inRestPlace /*= false*/)
-{
-    // Every 8h in resting zone we gain a bubble
-    // A bubble is 5% of the total xp so there are 20 bubbles
-    // So we gain (total XP/20 every 8h) (8h = 288800 sec)
-    // (TotalXP/20)/28800; simplified to (TotalXP/576000) per second
-    // Client automatically double the value sent so we have to divide it by 2
-    // So final formula (TotalXP/1152000)
-    float bonus = timePassed * (GetUInt32Value(PLAYER_NEXT_LEVEL_XP) / 1152000.0f); // Get the gained rest xp for given second
-    if (!offline)
-    {
-        bonus *= sWorld.getConfig(CONFIG_FLOAT_RATE_REST_INGAME);                   // Apply the custom setting
-    }
-    else
-    {
-        if (inRestPlace)
-        {
-            bonus *= sWorld.getConfig(CONFIG_FLOAT_RATE_REST_OFFLINE_IN_TAVERN_OR_CITY);
-        }
-        else
-        {
-            bonus *= sWorld.getConfig(CONFIG_FLOAT_RATE_REST_OFFLINE_IN_WILDERNESS) / 4.0f; // bonus is reduced by 4 when not in rest place
-        }
-    }
-    return bonus;
 }
 
 float Player::GetCollisionHeight(bool mounted) const
